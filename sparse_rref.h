@@ -191,12 +191,15 @@ namespace SparseRREF {
 
 	// The thresholds at which work is handed to the pool, and the size of the counting tables. All of
 	// them are empirical: picked where the shared (or counted) form starts to pay for itself.
+	inline constexpr size_t bignum_inline_work = 1u << 8;          // direct rational back-substitution
 	inline constexpr size_t sort_parallel_threshold = 1u << 14;    // parallel_sort(), the measured crossover
 	inline constexpr size_t product_parallel_threshold = 1u << 17; // tensor_product()
 	inline constexpr size_t pack_parallel_threshold = 1u << 17;    // tensor_contract()
 	inline constexpr size_t scan_parallel_threshold = 1u << 17;    // tensor_contract(), two indices
 	inline constexpr size_t join_parallel_threshold = 1u << 15;    // einstein_sum()
 	inline constexpr size_t mul_parallel_threshold = 1u << 14;     // sparse_mat_mul(), products per thread
+	inline constexpr size_t mul_parallel_threshold_bignum = 1u << 8; // rational products per thread
+	inline constexpr size_t mul_bignum_scratch_ratio = 16; // dense scratch slots per estimated product
 	inline constexpr size_t counting_max_buckets = 1u << 20;       // the counting passes (gen_perm())
 
 	// A range sort that runs on our own pool: the caller's pool sizes the parallelism, so --threads

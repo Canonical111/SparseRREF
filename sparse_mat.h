@@ -577,17 +577,32 @@ namespace SparseRREF {
 				}
 			};
 
-			if (thecol.size() < 20 * nthreads) {
-				// narrow columns are the common case, and dispatching a handful of
-				// updates through the pool costs far more in wake-ups and
-				// synchronization than the elimination itself (a 3 element batch was
-				// measured at ~16us of pool overhead against ~0.5us of work)
+			// Keep the word-size-field crossover. For multiprecision values, estimate
+			// work using both the column length and pivot-row length. Updates read the
+			// same pivot row and write distinct rows, so they can run independently.
+			bool run_inline;
+			size_t nblocks;
+			if constexpr (std::is_arithmetic_v<T>) {
+				run_inline = thecol.size() < 20 * nthreads;
+				nblocks = thecol.size() / 10;
+			}
+			else {
+				run_inline = nthreads == 1 || thecol.size() < 2
+					// ceil(cutoff / column_length) avoids overflowing the work product.
+					|| mat[row].nnz() < bignum_inline_work / thecol.size()
+						+ (bignum_inline_work % thecol.size() != 0);
+				const size_t n = thecol.size();
+				// At least 64 blocks per worker when possible, then roughly ten rows
+				// per block for tall columns. This form cannot overflow 64 * nthreads.
+				const size_t balanced = nthreads > n / 64 ? n : size_t(64) * nthreads;
+				nblocks = std::min(n, std::max(n / 10, balanced));
+			}
+			if (run_inline) {
 				for (size_t j = 0; j < thecol.size(); j++)
 					eliminate(j);
 			}
 			else {
-				pool.detach_loop<index_t>(0, thecol.size(), eliminate,
-					thecol.size() / 10);
+				pool.detach_loop<index_t>(0, thecol.size(), eliminate, nblocks);
 			}
 			pool.wait();
 
@@ -802,12 +817,24 @@ namespace SparseRREF {
 		const field_t& F, thread_pool* pool = nullptr) {
 
 		sparse_mat<T, index_t> A(B.nrow, C.ncol);
-		// The pool costs a task and a scratch per thread, and the scratch is sized by ncol, so
-		// short rows are better done serially; the crossover is roughly a fixed number of
-		// products per thread.
+		// Rational arithmetic pays for the pool at less work, but constructing every
+		// worker's dense scratch must also be justified by the estimated product count.
 		const size_t products = B.nnz() * (C.nrow ? C.nnz() / C.nrow : 0);
-		if (pool != nullptr && products < mul_parallel_threshold * pool->get_thread_count())
-			pool = nullptr;
+		if (pool != nullptr) {
+			if constexpr (std::is_arithmetic_v<T>) {
+				if (products < mul_parallel_threshold * pool->get_thread_count())
+					pool = nullptr;
+			}
+			else {
+				const size_t workers = pool->get_thread_count();
+				const size_t scratch_work = A.ncol / mul_bignum_scratch_ratio
+					+ (A.ncol % mul_bignum_scratch_ratio != 0);
+				const size_t per_thread = std::max(mul_parallel_threshold_bignum, scratch_work);
+				// Division avoids overflow in per_thread * workers. One row cannot be shared.
+				if (B.nrow < 2 || workers < 2 || products / workers < per_thread)
+					pool = nullptr;
+			}
+		}
 
 		auto nthreads = 1;
 		if (pool)
@@ -875,9 +902,16 @@ namespace SparseRREF {
 			};
 
 		if (pool) {
+			// Keep fine balance on small products without enqueuing one task per row
+			// on huge matrices. Each task still writes only independent output rows.
+			size_t nblocks = (B.nrow < 20 * nthreads) ? 0 : B.nrow / 10;
+			if constexpr (!std::is_arithmetic_v<T>) {
+				const size_t balanced = size_t(nthreads) > B.nrow / 64 ? B.nrow : size_t(64) * nthreads;
+				nblocks = std::min<size_t>(B.nrow, std::max<size_t>(B.nrow / 10, balanced));
+			}
 			pool->detach_loop(0, B.nrow, [&](size_t i) {
 				method(SparseRREF::thread_id(), i);
-				}, ((B.nrow < 20 * nthreads) ? 0 : B.nrow / 10));
+				}, nblocks);
 			pool->wait();
 		}
 		else {
