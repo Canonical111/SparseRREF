@@ -28,9 +28,10 @@ of its 16 bytes; a packed entry costs its limbs and 4 bytes.
 - A chunk keeps the residues of every prime until all its entries reconstruct, then only the values.
   A later prime checks the values (n = d r mod p) instead of storing its residues; a chunk whose
   values disagree goes back to residues (kept alongside the values while all residues fit
-  `SPARSERREF_RR_KEEP_MB`, 512 MB, otherwise recomputed from the values). The fraction within the
-  bounds is unique, so the stopping prime and every value are those of reconstructing every entry at
-  every prime.
+  `SPARSERREF_RR_KEEP_MB`, 512 MB, otherwise recomputed from the values). Every value agrees with
+  the residues of all primes used and the height condition at the end certifies the result, which
+  is unique; the primes side by side and the large common denominator (below) only move the prime
+  at which this stops, never the output.
 - The height check runs on the packed values (lcm with repeated denominators skipped; a product is
   formed only where its size bound can reach the maximum so far).
 - `sparse_mat_rref_reconstruct` returns the rational matrix as before (built chunk by chunk from the
@@ -49,6 +50,32 @@ before the CRT, so this costs one CRT and a small gcd; D (at most three limbs) t
 denominator of every entry that needs the Euclidean path. In O2L12 99.7 % of the entries have a
 denominator dividing that of the entries before them: the CRT and reconstruction took 21.7 s with
 FLINT and 6.4 s with this (4 threads, M1 Max), 11.0 s and 3.3 s on an i9-13900K (8 threads).
+
+Beyond the fixed-size path (many primes) the CPU keeps FLINT's CRT and reconstruction, with a
+common denominator of its own (`qpack::big_den`): there the denominators of a row often differ by
+small factors and their least common multiple exceeds FLINT's bound sqrt(m/2), so it takes the
+fraction (y/g)/(D/g) whenever |y| < m / 2^65 (y is then n D/d exactly; a D that is not a multiple of
+the entry's denominator gives a y that is in effect random, so a wrong value comes with probability
+2^-64, and a later prime or the height condition would still reject it). At 418 primes (r600) that
+is a CRT and a gcd, about 170 us, instead of the 445 us of CRT and half extended Euclid.
+
+### Many primes: side by side
+
+A system whose result has large numbers needs many primes (418 for r600), and one prime's
+elimination of a small matrix takes a few milliseconds that threads hardly shorten: most of it was
+the pool's handoffs between its many small parallel loops. Once four primes have not sufficed, the
+further primes are replayed side by side, one per thread, as many as their matrices fit
+`replay_mb` (256 MB), each through an option of its own whose pool runs its loops inline
+(`thread_pool::set_inline`), and then taken in their order as if one after another. With one thread
+the same inline path serves one prime at a time. Not where the replays go to the GPU, and not with
+`--policy lean` (`replay_mb` 0). The sample tried before a full reconstruction is 1/16 of the
+entries (256 to 4096), so that it stays cheap next to the full attempt when entries are expensive.
+
+Measured on pi (i9-13900K, 10 threads of a shared node, the version before against this one in the
+same job, outputs identical): r600 over Q 5.1-5.5 s -> 1.6 s (one thread 24.4 s -> 12.8 s; memory
+unchanged, 126-131 MB; lean 4.8 s and 98 MB), r400 1.4-1.6 s -> 0.30 s, r300 0.15 s -> 0.05 s;
+bench12, bfss_L11 and O2L12 (one to six primes) unchanged. In r600 the eliminations of 426 primes
+now take 0.18 s and the reconstruction 1.36 s.
 
 ## What runs on the GPU
 
@@ -127,6 +154,7 @@ environment variable. The CLI maps its flags and environment variables onto them
 | `rr_chunk` | 0 (nent/64 in [4096, 4M]) | `SPARSERREF_RR_CHUNK` | entries per chunk of the packed result |
 | `rr_keep_mb` | 512 (lean 0) | `SPARSERREF_RR_KEEP_MB` | residues kept with the values while all of them fit |
 | `trim_heap` | true (fast false) | `SPARSERREF_TRIM` | give freed heap pages back after rounds that shrank the matrix |
+| `replay_mb` | 256 (lean 0, fast 4096) | `SPARSERREF_REPLAY_MB` | memory for the matrices of primes replayed side by side; 0: one prime at a time on all threads |
 | `memory` | balanced | `--policy` | lean also trims the rows after the forward elimination; fast keeps one prime's matrix for the next |
 
 The CLI alone also reads `SPARSERREF_GPU_WARMUP` (`1`: create the CUDA context while the input is
@@ -147,7 +175,7 @@ and peak resident set (`/usr/bin/time`), best of two runs. Every output is ident
 | O2L12 over Z/p | 8.9 s, 3.0 GB | 6.2 s, 1.2 GB | 1.7 s, 1.2 GB |
 | bench12 (result 1e6 entries) over Q | 1.53 s, 164 MB | 0.50 s, 145 MB | 0.50 s (CPU: too small) |
 | bench12 over Z/p | 1.11 s, 106 MB | 0.41 s, 107 MB | 0.40 s (CPU: too small) |
-| r600 (sparse 600 x 640, 2400 entries; result 1.5e4 entries of about 12000 bits, 418 primes) over Q | 7.4 s, 264 MB | 4.1 s, 135 MB | 4.6 s (a CPU run: below `SPARSERREF_GPU_MIN_NNZ`) |
+| r600 (sparse 600 x 640, 2400 entries; result 1.5e4 entries of about 12000 bits, 418 primes) over Q | 7.4 s, 264 MB | 4.1 s, 135 MB (before the primes side by side, below) | 4.6 s (a CPU run: below `SPARSERREF_GPU_MIN_NNZ`) |
 
 Where the time went over Q, for O2L12 on the CPU: the rational result as `fmpq` and its reconstruction (now
 packed limbs, the fixed-size CRT and the common denominator), the residues of every prime held at once (now
