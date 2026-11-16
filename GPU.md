@@ -147,7 +147,7 @@ and peak resident set (`/usr/bin/time`), best of two runs. Every output is ident
 | O2L12 over Z/p | 8.9 s, 3.0 GB | 6.2 s, 1.2 GB | 1.7 s, 1.2 GB |
 | bench12 (result 1e6 entries) over Q | 1.53 s, 164 MB | 0.50 s, 145 MB | 0.50 s (CPU: too small) |
 | bench12 over Z/p | 1.11 s, 106 MB | 0.41 s, 107 MB | 0.40 s (CPU: too small) |
-| r600 (dense 600 x 601, 418 primes) over Q | 7.4 s, 264 MB | 4.1 s, 135 MB | 4.6 s |
+| r600 (sparse 600 x 640, 2400 entries; result 1.5e4 entries of about 12000 bits, 418 primes) over Q | 7.4 s, 264 MB | 4.1 s, 135 MB | 4.6 s (a CPU run: below `SPARSERREF_GPU_MIN_NNZ`) |
 
 Where the time went over Q, for O2L12 on the CPU: the rational result as `fmpq` and its reconstruction (now
 packed limbs, the fixed-size CRT and the common denominator), the residues of every prime held at once (now
