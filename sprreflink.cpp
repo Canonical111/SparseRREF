@@ -692,7 +692,7 @@ namespace {
 
 		WolframIOLibrary_Functions io_;
 		mint id_;
-		rref_option_t opt_;
+		rref_option* opt_; // rref_option_t is an array type: it cannot be initialised from the pointer
 		std::string line_;
 	};
 

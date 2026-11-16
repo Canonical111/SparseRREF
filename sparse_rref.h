@@ -236,6 +236,71 @@ namespace SparseRREF {
 		}
 	}
 
+	// Execution policy: how the work is carried out where there is a choice. The result never depends on
+	// it (same pivots, same output): a policy only trades time against memory, or moves work to a GPU.
+	// It is a value carried by rref_option (opt->policy), so a program, the command line or the
+	// Mathematica interface chooses it at run time; start from a preset of SparseRREF::policy and adjust
+	// fields.
+	enum class memory_mode : uint8_t {
+		lean,     // save memory where it costs time
+		balanced, // the default
+		fast      // spend memory where it saves time
+	};
+
+	// The GPU part: used only by a build with SPARSERREF_USE_CUDA, and only for work of at least min_nnz
+	// entries; without a usable device everything runs on the CPU.
+	struct gpu_policy {
+		bool enabled = false;
+		size_t min_nnz = (size_t)1 << 20;        // smallest remaining matrix (entries) worth the GPU
+		bool forward = true;                     // the forward elimination (Z/p, and the first prime over Q)
+		bool search = true;                      // its pivot search (method 0)
+		bool backsub = true;                     // the back substitution
+		bool replay = true;                      // the eliminations of the further primes over Q
+		bool reconstruct = true;                 // the CRT and rational reconstruction over Q
+		size_t backsub_split = 0;                // pivots per back-substitution batch; 0: max(rank / 64, 2048)
+		size_t transfer_piece = (size_t)1 << 22; // entries per page-locked host-device transfer piece
+		size_t rr_pinned_mb = 512;               // page-locked memory of the reconstruction
+		// the per-call Schur path (rows shipped per call, where the matrix is not resident on the GPU)
+		size_t call_min_rows = 4096, call_min_pivots = 32;
+		size_t call_max_arena = (size_t)1 << 28, call_chunk = (size_t)1 << 23;
+		bool call_large_u = true;
+	};
+
+	struct exec_policy {
+		memory_mode memory = memory_mode::balanced;
+		gpu_policy gpu;
+		size_t rr_chunk = 0;     // entries per chunk of the rational result (packed form); 0: automatic
+		size_t rr_keep_mb = 512; // residues kept next to the reconstructed values while they fit this
+		bool trim_heap = true;   // give freed heap pages back to the system after the matrix shrank a lot
+	};
+
+	// Presets, in the spirit of std::execution::seq and par.
+	namespace policy {
+		inline exec_policy balanced() { return exec_policy{}; }
+		// rows trimmed to their size after the forward elimination, no residues kept next to the
+		// reconstructed values, small page-locked GPU buffers
+		inline exec_policy lean() {
+			exec_policy p;
+			p.memory = memory_mode::lean;
+			p.rr_keep_mb = 0;
+			p.gpu.transfer_piece = (size_t)1 << 20;
+			p.gpu.rr_pinned_mb = 128;
+			return p;
+		}
+		// the matrix of one prime keeps its memory for the next one, no heap trim
+		inline exec_policy fast() {
+			exec_policy p;
+			p.memory = memory_mode::fast;
+			p.trim_heap = false;
+			return p;
+		}
+		// a preset with the GPU paths on
+		inline exec_policy gpu(exec_policy p = balanced()) {
+			p.gpu.enabled = true;
+			return p;
+		}
+	}
+
 	// rref_option
 	// method 0: right and left search
 	// method 1: only right search (with the default col_weight its pivot columns are the
@@ -246,7 +311,7 @@ namespace SparseRREF {
 		bool verbose = false;
 		std::ostream* progress_out = &std::cout; // nullptr disables progress output
 		bool progress_overwrite = true; // rewrite the progress line in place on a terminal
-		bool shrink_memory = false;
+		bool shrink_memory = false; // rows trimmed after the forward elimination (implied by memory_mode::lean)
 		std::atomic<bool> abort = false;
 		bool is_back_sub = true;
 		bool eliminate_one_nnz = true;
@@ -254,6 +319,7 @@ namespace SparseRREF {
 		int print_step = 100;
 		std::function<int64_t(int64_t)> col_weight = [](int64_t i) { return i; };
 		thread_pool pool = thread_pool(1); // default: thread pool with 1 thread
+		exec_policy policy;                // how (not what): see exec_policy
 	};
 	using rref_option_t = rref_option[1];
 

@@ -80,6 +80,41 @@ using namespace SparseRREF;
 	std::cout << "nrow: " << (mat).nrow << " ";                                \
 	std::cout << "ncol: " << (mat).ncol << std::endl
 
+// The environment variables of the CLI (the library reads none): SPARSERREF_GPU=1 enables the GPU like
+// --gpu; the others adjust the policy's tunables (see exec_policy and GPU.md).
+static void apply_environment(SparseRREF::exec_policy& pol, bool gpu_flag) {
+	auto flag = [](const char* name, bool& v) {
+		if (const char* e = std::getenv(name))
+			v = e[0] != '0';
+	};
+	auto size = [](const char* name, size_t& v) {
+		if (const char* e = std::getenv(name))
+			v = (size_t)std::strtoull(e, nullptr, 10);
+	};
+	auto& g = pol.gpu;
+	if (const char* e = std::getenv("SPARSERREF_GPU"))
+		g.enabled = e[0] == '1';
+	if (gpu_flag)
+		g.enabled = true;
+	size("SPARSERREF_GPU_MIN_NNZ", g.min_nnz);
+	flag("SPARSERREF_GPU_FORWARD", g.forward);
+	flag("SPARSERREF_GPU_SEARCH", g.search);
+	flag("SPARSERREF_GPU_BACKSUB", g.backsub);
+	flag("SPARSERREF_GPU_REPLAY", g.replay);
+	flag("SPARSERREF_GPU_RR", g.reconstruct);
+	size("SPARSERREF_GPU_BS_SPLIT", g.backsub_split);
+	size("SPARSERREF_GPU_PIECE", g.transfer_piece);
+	size("SPARSERREF_GPU_RR_PINNED_MB", g.rr_pinned_mb);
+	size("SPARSERREF_GPU_MIN_ROWS", g.call_min_rows);
+	size("SPARSERREF_GPU_MIN_PIVOTS", g.call_min_pivots);
+	size("SPARSERREF_GPU_MAX_ARENA", g.call_max_arena);
+	size("SPARSERREF_GPU_CHUNK", g.call_chunk);
+	flag("SPARSERREF_GPU_LARGE", g.call_large_u);
+	size("SPARSERREF_RR_CHUNK", pol.rr_chunk);
+	size("SPARSERREF_RR_KEEP_MB", pol.rr_keep_mb);
+	flag("SPARSERREF_TRIM", pol.trim_heap);
+}
+
 int main(int argc, char** argv) {
 	Flint::set_memory_functions();
 
@@ -140,6 +175,18 @@ int main(int argc, char** argv) {
 	program.add_usage_newline();
 	program.add_argument("-nb", "--no-backward-substitution")
 		.help("no backward substitution")
+		.default_value(false)
+		.implicit_value(true)
+		.nargs(0);
+	program.add_usage_newline();
+	program.add_argument("--policy")
+		.help("how to trade time against memory (the result is the same):\n"
+			"lean, balanced or fast")
+		.default_value(std::string("balanced"))
+		.nargs(1);
+	program.add_argument("--gpu")
+		.help("use the GPU (a build with SPARSERREF_USE_CUDA; also SPARSERREF_GPU=1);\n"
+			"without a usable device everything runs on the CPU")
 		.default_value(false)
 		.implicit_value(true)
 		.nargs(0);
@@ -211,6 +258,20 @@ int main(int argc, char** argv) {
 		opt->pool.reset(nthread);
 
 	nthread = (int)opt->pool.get_thread_count();
+	{
+		const auto pol = program.get<std::string>("--policy");
+		if (pol == "lean")
+			opt->policy = SparseRREF::policy::lean();
+		else if (pol == "balanced")
+			opt->policy = SparseRREF::policy::balanced();
+		else if (pol == "fast")
+			opt->policy = SparseRREF::policy::fast();
+		else {
+			std::cerr << "The policy is not valid: " << pol << ". It should be lean, balanced or fast." << std::endl;
+			exit(1);
+		}
+	}
+	apply_environment(opt->policy, program["--gpu"] == true);
 	opt->verbose = (program["--verbose"] == true);
 	opt->is_back_sub = (program["--no-backward-substitution"] == false);
 	opt->print_step = program.get<int>("--print_step");
@@ -237,6 +298,7 @@ int main(int argc, char** argv) {
 	else
 		F = field_t(SparseRREF::RING::FIELD_Fp, prime);
 
+	SPR_MEM("start");
 	auto start = SparseRREF::clocknow();
 	auto input_file = program.get<std::string>("input_file");
 	std::filesystem::path filePath = input_file;
@@ -244,6 +306,20 @@ int main(int argc, char** argv) {
 		std::cerr << "File does not exist: " << filePath << std::endl;
 		exit(1);
 	}
+#ifdef SPARSERREF_USE_CUDA
+	// With the GPU enabled, its context (a tenth of a second or more) can be created while the input is
+	// read. A context that then goes unused (small fill-in: everything stays on the CPU) costs about as
+	// much at exit and 100 MB, so this is done by itself only for inputs of 64 MB or more, where reading
+	// takes longer; SPARSERREF_GPU_WARMUP=1 / 0 decides otherwise.
+	if (opt->policy.gpu.enabled) {
+		const char* w = std::getenv("SPARSERREF_GPU_WARMUP");
+		std::error_code ec;
+		const auto size = std::filesystem::file_size(filePath, ec);
+		const bool warm = w != nullptr ? w[0] == '1' : (!ec && size >= ((uintmax_t)64 << 20));
+		if (warm)
+			std::thread([] { SparseRREF::gpu::warmup(); }).detach();
+	}
+#endif
 	
 	using index_t = uint32_t;
 	std::variant<sparse_mat<rat_t, index_t>, sparse_mat<ulong, index_t>> mat;
@@ -265,6 +341,7 @@ int main(int argc, char** argv) {
 	}
 
 	auto end = SparseRREF::clocknow();
+	SPR_MEM("read");
 	std::cout << "-------------------" << std::endl;
 	printtime("read");
 
@@ -282,7 +359,17 @@ int main(int argc, char** argv) {
 
 	start = SparseRREF::clocknow();
 	std::vector<std::vector<pivot_t<index_t>>> pivots;
-	if (prime == 0) {
+	// over Q the result goes to the text file straight from its packed form (a few words per entry
+	// instead of an fmpq with two heap-allocated parts each); the kernel and the WXF output need the
+	// rational matrix
+	const bool is_wxf = file_ext == ".wxf" || file_ext == ".WXF";
+	const bool use_packed = prime == 0 && !is_wxf && program["--kernel"] != true;
+	sparse_qmat_packed<index_t> qres;
+	bool have_packed = false;
+	if (prime == 0 && use_packed) {
+		have_packed = sparse_mat_rref_reconstruct_packed(std::get<0>(mat), opt, pivots, qres);
+	}
+	else if (prime == 0) {
 		pivots = sparse_mat_rref_reconstruct(std::get<0>(mat), opt);
 	}
 	else {
@@ -298,13 +385,18 @@ int main(int argc, char** argv) {
 	end = SparseRREF::clocknow();
 	std::cout << "-------------------" << std::endl;
 	printtime("RREF");
+	SPR_MEM("rref done");
+	SPR_DO(SparseRREF::prof::report(stdout));
 
 	size_t rank = 0;
 	for (auto& p : pivots) {
 		rank += p.size();
 	}
 	std::cout << "rank: " << rank << " ";
-	if (prime == 0) {
+	if (have_packed) {
+		printmatinfo(qres);
+	}
+	else if (prime == 0) {
 		printmatinfo(std::get<0>(mat));
 	}
 	else {
@@ -349,16 +441,19 @@ int main(int argc, char** argv) {
 	}
 	else {
 		file2.open(outname + outname_add);
-		if (prime == 0) {
-			sparse_mat_write(std::get<0>(mat), file2, SparseRREF::SPARSE_FILE_TYPE_PLAIN);
+		if (have_packed) {
+			qres.write(file2, &opt->pool);
+		}
+		else if (prime == 0) {
+			sparse_mat_write(std::get<0>(mat), file2, SparseRREF::SPARSE_FILE_TYPE_PLAIN, &opt->pool);
 		}
 		else {
 			if (prime > (1ULL << 32)) {
 				std::cout << "Warning: the prime is too large, use plain format." << std::endl;
-				sparse_mat_write(std::get<1>(mat), file2, SparseRREF::SPARSE_FILE_TYPE_PLAIN);
+				sparse_mat_write(std::get<1>(mat), file2, SparseRREF::SPARSE_FILE_TYPE_PLAIN, &opt->pool);
 			}
 			else
-				sparse_mat_write(std::get<1>(mat), file2, SparseRREF::SPARSE_FILE_TYPE_MTX);
+				sparse_mat_write(std::get<1>(mat), file2, SparseRREF::SPARSE_FILE_TYPE_MTX, &opt->pool);
 		}
 		file2.close();
 	}
@@ -374,7 +469,7 @@ int main(int argc, char** argv) {
 				}
 				else {
 					file2.open(outname + outname_add);
-					sparse_mat_write(K, file2, SparseRREF::SPARSE_FILE_TYPE_PLAIN);
+					sparse_mat_write(K, file2, SparseRREF::SPARSE_FILE_TYPE_PLAIN, &opt->pool);
 					file2.close();
 				}
 			}
@@ -391,9 +486,9 @@ int main(int argc, char** argv) {
 				else {
 					file2.open(outname + outname_add);
 					if (prime > (1ULL << 32))
-						sparse_mat_write(K, file2, SparseRREF::SPARSE_FILE_TYPE_PLAIN);
+						sparse_mat_write(K, file2, SparseRREF::SPARSE_FILE_TYPE_PLAIN, &opt->pool);
 					else
-						sparse_mat_write(K, file2, SparseRREF::SPARSE_FILE_TYPE_MTX);
+						sparse_mat_write(K, file2, SparseRREF::SPARSE_FILE_TYPE_MTX, &opt->pool);
 					file2.close();
 				}
 			}
@@ -404,6 +499,8 @@ int main(int argc, char** argv) {
 
 	end = SparseRREF::clocknow();
 	printtime("write files");
+	SPR_MEM("written");
+	SPR_DO(SparseRREF::prof::report_mem(stdout));
 
 	opt->abort = true; // stop the key listener
 
@@ -419,6 +516,10 @@ int main(int argc, char** argv) {
 	std::cout << "total CPU time: " << (minfo.user_msecs + minfo.system_msecs) / 1000.0 << " seconds." << std::endl;
 #endif
 
-	Flint::clear_cache();
-	return 0;
+	// The matrices can hold tens of millions of FLINT numbers (68 million rationals on a 1e5-row
+	// system: about 2 s of destructor calls); the output is written and closed, so let the OS
+	// reclaim the memory at exit instead.
+	std::cout.flush();
+	std::fflush(nullptr);
+	std::_Exit(0);
 }

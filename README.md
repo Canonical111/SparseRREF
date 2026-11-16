@@ -45,6 +45,17 @@ g++ sprreflink.cpp -fPIC -shared -O3 -std=c++20 -o sprreflink.dll -I$MATHEMATICA
 where we assume that the FLINT library and GMP library are installed in `$LIB`, the header files are in `$INCLUDE`,
 and `$MATHEMATICA_HOME/SystemFiles/IncludeFiles/C` is the path of Mathematica C header files.
 
+**GPU (optional).** A build with `-DSPARSERREF_USE_CUDA` and the three CUDA files can move the elimination over
+$\mathbb Z/p$, the further primes over $\mathbb Q$ and the rational reconstruction to an NVIDIA GPU. Without the macro
+nothing of CUDA is compiled or needed, and even a CUDA build uses the GPU only when asked (`--gpu`, or
+`policy.gpu.enabled` in the library) and when a device is there; otherwise everything runs on the CPU. The result is
+the same either way. See [GPU.md](GPU.md).
+```bash
+nvcc -O3 -std=c++17 -arch=sm_90 -c sparse_gpu.cu sparse_gpu_rr.cu sparse_gpu_res.cu   # sm_XX: your GPU
+g++ main.cpp sparse_gpu.o sparse_gpu_rr.o sparse_gpu_res.o -o sparserref -O3 -std=c++20 -DSPARSERREF_USE_CUDA \
+    -I$INCLUDE -L$LIB -lflint -lmpfr -lgmp -L$CUDA_HOME/lib64 -lcudart -lpthread
+```
+
 ### How to use the code
 
 #### Standalone executable
@@ -57,6 +68,7 @@ Usage: SparseRREF [--help] [--version] [--output VAR]
                   [--field VAR] [--prime VAR] [--threads VAR]
                   [--verbose] [--print_step VAR]
                   [--no-backward-substitution]
+                  [--policy VAR] [--gpu]
                   input_file
 
 (exact) Sparse Reduced Row Echelon Form v0.4.2
@@ -83,6 +95,10 @@ Optional arguments:
   -V, --verbose                    prints information of calculation
   -ps, --print_step                print step when --verbose is enabled [default: 100]
   -nb, --no-backward-substitution  no backward substitution
+  --policy                         how to trade time against memory (the result is the same):
+                                   lean, balanced or fast [default: "balanced"]
+  --gpu                            use the GPU (a build with SPARSERREF_USE_CUDA; also SPARSERREF_GPU=1);
+                                   without a usable device everything runs on the CPU
 ```
 
 With `--verbose`, progress lines are rewritten in place when the output is a terminal and
@@ -112,6 +128,26 @@ row_index_n column_index_n value_n
 The last line is a dummy line, which is used to indicate the end of the matrix.
 
 The main function is `sparse_mat_rref`; its output is its pivots, and it reduces the input matrix $M$ in place to its RREF $\Lambda$.
+
+#### Execution policy
+
+Where the computation has a choice between time and memory, or between the CPU and a GPU, the choice is the
+caller's: `rref_option` carries an `exec_policy` (`opt->policy`), a value set at run time, in the spirit of
+`std::execution::seq`/`par`. It never changes the result, only how it is obtained.
+
+```cpp
+rref_option_t opt;
+opt->pool.reset(16);                          // how many threads
+opt->policy = SparseRREF::policy::lean();     // how to use them: lean(), balanced() (the default) or fast()
+opt->policy.gpu.enabled = true;               // or SparseRREF::policy::gpu(...): CUDA builds only
+auto pivots = sparse_mat_rref(mat, F, opt);
+```
+
+`lean` trims the rows after the forward elimination, keeps no residues next to reconstructed values and uses small
+page-locked GPU buffers; `fast` keeps the memory of one prime's matrix for the next one and skips the heap trim; the
+fields of `exec_policy` and `gpu_policy` can also be set one by one. The command line chooses the preset with
+`--policy` and the GPU with `--gpu`; its environment variables (`SPARSERREF_GPU*`, `SPARSERREF_RR_*`,
+`SPARSERREF_TRIM`) adjust single fields, while the library itself reads none.
 
 #### WXF (Wolfram) input and output
 

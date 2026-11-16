@@ -100,9 +100,13 @@ namespace SparseRREF {
 				return;
 			s_free(indices);
 			indices = nullptr;
-			for (size_t i = 0; i < _alloc; i++)
-				entries[i].~T();
-			s_free(entries);
+			// entries can be null: a row whose values are kept elsewhere (the GPU forward elimination)
+			if (entries != nullptr) {
+				if constexpr (!std::is_trivially_destructible_v<T>)
+					for (size_t i = 0; i < _alloc; i++)
+						entries[i].~T();
+				s_free(entries);
+			}
 			entries = nullptr;
 			_alloc = 0;
 			_nnz = 0;
@@ -526,7 +530,7 @@ namespace SparseRREF {
 
 		void push_back(const index_t index, const bool val = true) {
 			if (_nnz + 1 > _alloc)
-				reserve((1 + _alloc) * 2); // +1 to avoid _alloc = 0
+				reserve(_alloc + _alloc / 2 + 4); // grow by half (these are the transposes of large matrices)
 			indices[_nnz] = index;
 			_nnz++;
 		}
