@@ -153,10 +153,84 @@ namespace SparseRREF {
 		std::copy(ini, ini + size, des);
 	}
 
-	// thread pool
-	using thread_pool = BS::thread_pool<>;
+	// thread pool: BS::thread_pool, which can also be switched to run every task at once on the calling
+	// thread (set_inline). A computation that is one of several running side by side, each on one
+	// thread of another pool (the primes of a rational reconstruction), then pays no handoff for its
+	// many small parallel loops; wait() has nothing to wait for. Only loops, blocks and sequences
+	// followed by wait() may run inline: a task that waits for work submitted after it would never
+	// return.
+	namespace detail {
+		inline thread_local bool inline_task = false; // a task of an inline pool runs on this thread
+		struct inline_scope {
+			bool prev;
+			inline_scope() : prev(inline_task) { inline_task = true; }
+			~inline_scope() { inline_task = prev; }
+			inline_scope(const inline_scope&) = delete;
+			inline_scope& operator=(const inline_scope&) = delete;
+		};
+	}
+	class thread_pool : public BS::thread_pool<> {
+		using base = BS::thread_pool<>;
+		bool inl = false;
+	public:
+		using base::base;
+		// inline (true) or back to the pool's threads (false)
+		void set_inline(const bool on) {
+			if (!inl)
+				base::wait();
+			inl = on;
+		}
+		bool is_inline() const noexcept { return inl; }
+		std::size_t get_thread_count() const noexcept { return inl ? 1 : base::get_thread_count(); }
+		template <typename T1, typename T2, typename T = BS::common_index_type_t<T1, T2>, typename F>
+		void detach_loop(const T1 first, const T2 last, F&& loop, const std::size_t num_blocks = 0, const BS::priority_t priority = 0) {
+			if (!inl)
+				return base::detach_loop<T1, T2, T>(first, last, std::forward<F>(loop), num_blocks, priority);
+			detail::inline_scope sc;
+			for (T i = static_cast<T>(first); i < static_cast<T>(last); ++i)
+				loop(i);
+		}
+		template <typename T1, typename T2, typename T = BS::common_index_type_t<T1, T2>, typename F>
+		void detach_blocks(const T1 first, const T2 last, F&& block, const std::size_t num_blocks = 0, const BS::priority_t priority = 0) {
+			if (!inl)
+				return base::detach_blocks<T1, T2, T>(first, last, std::forward<F>(block), num_blocks, priority);
+			detail::inline_scope sc;
+			if (static_cast<T>(first) < static_cast<T>(last))
+				block(static_cast<T>(first), static_cast<T>(last));
+		}
+		template <typename T1, typename T2, typename T = BS::common_index_type_t<T1, T2>, typename F>
+		void detach_sequence(const T1 first, const T2 last, F&& sequence, const BS::priority_t priority = 0) {
+			if (!inl)
+				return base::detach_sequence<T1, T2, T>(first, last, std::forward<F>(sequence), priority);
+			detail::inline_scope sc;
+			for (T i = static_cast<T>(first); i < static_cast<T>(last); ++i)
+				sequence(i);
+		}
+		void wait() {
+			if (!inl)
+				base::wait();
+		}
+		template <typename R, typename P>
+		bool wait_for(const std::chrono::duration<R, P>& duration) {
+			return inl ? true : base::wait_for(duration);
+		}
+		void purge() {
+			if (!inl)
+				base::purge();
+		}
+		using base::reset; // the forms with a thread initialization function
+		void reset() {
+			inl = false;
+			base::reset();
+		}
+		void reset(const std::size_t num_threads) {
+			inl = false;
+			base::reset(num_threads);
+		}
+	};
 	// only call this from inside a pool task: off the pool get_index() is empty and value() throws
-	inline size_t thread_id() { return BS::this_thread::get_index().value(); }
+	// (a task of an inline pool is thread 0 of its pool)
+	inline size_t thread_id() { return detail::inline_task ? 0 : BS::this_thread::get_index().value(); }
 
 	// The entries of one range split into at most `nthread` consecutive blocks of (nearly) equal size,
 	// the larger ones first. This is the split the row wise passes hand to the pool, so one very long row
@@ -275,26 +349,33 @@ namespace SparseRREF {
 		size_t rr_chunk = 0;     // entries per chunk of the rational result (packed form); 0: automatic
 		size_t rr_keep_mb = 512; // residues kept next to the reconstructed values while they fit this
 		bool trim_heap = true;   // give freed heap pages back to the system after the matrix shrank a lot
+		// Over Q, once a few primes have not sufficed, the further primes are replayed side by side, one
+		// per thread, as many as their matrices fit this (MB); 0: one prime at a time on all threads. It
+		// pays where one prime's elimination is too small to share among threads and many primes are
+		// needed; the result is the same.
+		size_t replay_mb = 256;
 	};
 
 	// Presets, in the spirit of std::execution::seq and par.
 	namespace policy {
 		inline exec_policy balanced() { return exec_policy{}; }
 		// rows trimmed to their size after the forward elimination, no residues kept next to the
-		// reconstructed values, small page-locked GPU buffers
+		// reconstructed values, one prime at a time, small page-locked GPU buffers
 		inline exec_policy lean() {
 			exec_policy p;
 			p.memory = memory_mode::lean;
 			p.rr_keep_mb = 0;
+			p.replay_mb = 0;
 			p.gpu.transfer_piece = (size_t)1 << 20;
 			p.gpu.rr_pinned_mb = 128;
 			return p;
 		}
-		// the matrix of one prime keeps its memory for the next one, no heap trim
+		// the matrix of one prime keeps its memory for the next one, no heap trim, more primes side by side
 		inline exec_policy fast() {
 			exec_policy p;
 			p.memory = memory_mode::fast;
 			p.trim_heap = false;
+			p.replay_mb = 4096;
 			return p;
 		}
 		// a preset with the GPU paths on

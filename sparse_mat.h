@@ -1634,8 +1634,8 @@ namespace SparseRREF {
 			auto schur_complete_func = schur_strategy<T, index_t>(density);
 
 			SPR_T0(spr_bs);
-			SPR_DO(SparseRREF::prof::d().bs_batches++);
-			SPR_DO(SparseRREF::prof::d().bs_schur_rows += leftrows.size());
+			SPR_INC(bs_batches, 1);
+			SPR_INC(bs_schur_rows, leftrows.size());
 			std::atomic<size_t> cc = 0;
 			schur_index_guard<T, index_t> spr_index(g_helper, sub_pivots);
 			const bool spr_gpu = schur_try_gpu(mat, leftrows, sub_pivots, F, pool, g_helper, opt->policy);
@@ -2109,7 +2109,7 @@ namespace SparseRREF {
 						}
 						else {
 							level_batch(rest, mat.ncol, row_cols, batch);
-							SPR_DO(SparseRREF::prof::d().level_batches++);
+							SPR_INC(level_batches, 1);
 							if (batch.empty()) { // not pivots of this matrix: the CPU reports it
 								ok = false;
 								break;
@@ -2332,7 +2332,7 @@ namespace SparseRREF {
 						mat[r] = v;
 					leftrows = leftrows_saved;
 					combined_pivots.resize(combined_at);
-					SPR_DO(SparseRREF::prof::d().level_retries++);
+					SPR_INC(level_retries, 1);
 				}
 				auto rest = level;
 				bool stuck = false;
@@ -2365,7 +2365,7 @@ namespace SparseRREF {
 					std::stable_partition(leftrows.end() - before, leftrows.end(), [&](size_t r) { return !in_batch[r]; });
 					for (auto [r, c] : batch)
 						in_batch[r] = 0;
-					SPR_DO(SparseRREF::prof::d().level_batches++);
+					SPR_INC(level_batches, 1);
 					apply_level(batch);
 				}
 				done = !stuck;
@@ -3619,10 +3619,11 @@ namespace SparseRREF {
 	//
 	// The result is built in packed form (sparse_qpack.h), in chunks of whole rows: a chunk keeps the
 	// residues of every prime used until all its entries reconstruct, then only the reconstructed
-	// values, which a later prime checks (n = d r mod p) instead of storing its residues. A value
-	// that agrees with every residue and lies within the bounds of the current modulus is what the
-	// reconstruction at that modulus returns (the fraction within the bounds is unique), so the prime
-	// at which this stops and every value are those of reconstructing all entries at every prime.
+	// values, which a later prime checks (n = d r mod p) instead of storing its residues. Every value
+	// agrees with the residues of all primes used, and the height condition at the end certifies the
+	// result, which is unique: so neither the primes replayed side by side (a few more than needed)
+	// nor the values found by way of a common denominator before the Euclidean reconstruction could
+	// find them (qpack::big_den) change it; they only move the prime at which this stops.
 	// Returns true with the result in out; false on abort or when checkrank fails (mat is then the
 	// input, possibly with the rows outside the pivots cleared, as before).
 	template <typename index_t>
@@ -3764,8 +3765,9 @@ namespace SparseRREF {
 		// delivered by the GPU
 		std::unique_ptr<ulong[]> cur;
 		bool cur_valid = false;
+		const sparse_mat<ulong, index_t>* resmat = &matul; // or one of the primes replayed side by side
 		auto res_row = [&](size_t li) -> const ulong* {
-			return cur_valid ? cur.get() + eoff[li] : matul[leftrows[li]].entries;
+			return cur_valid ? cur.get() + eoff[li] : (*resmat)[leftrows[li]].entries;
 			};
 
 		// the current prime's residues appended to every chunk that keeps residues
@@ -3843,10 +3845,29 @@ namespace SparseRREF {
 			return rec_entry(ch, e, k, comb, temp, rk, z, q);
 			};
 
+		// the common denominator of qpack::big_den: where the fixed-size path does not apply (many primes)
+		auto big_den_on = [&](slong k, const fmpz_comb_struct* comb) {
+			bool on = k > 1 && comb != nullptr;
+#ifdef SPARSERREF_HAVE_RR_CORE
+			on = on && !frr.on();
+#endif
+			return on;
+			};
+		auto big_den_setup = [&](slong k, std::vector<nmod_t>& md) {
+			md.resize(k);
+			for (slong t = 0; t < k; t++)
+				nmod_init(&md[t], primes_used[t]);
+			};
+
 		// all entries of an unpacked chunk on the CPU; on success the chunk keeps the values only
 		auto attempt_chunk_cpu = [&](qpack::chunk& ch, slong k, const fmpz_comb_t comb) -> bool {
 			const size_t half = fmpz_size(mod.data()) / 2 + 1; // limbs of N = floor(sqrt((mod - 1) / 2)), at most
 			const size_t per = qpack::entry_limbs(half, half);
+			const bool use_bd = big_den_on(k, comb);
+			std::vector<nmod_t> md;
+			const slong mbits = (slong)mod.bits();
+			if (use_bd)
+				big_den_setup(k, md);
 			auto bounds = row_blocks(ch.li0, ch.li1, 4 * nthreads);
 			const size_t nb = bounds.size() - 1;
 			std::vector<qpack::segment> segs(nb);
@@ -3867,6 +3888,8 @@ namespace SparseRREF {
 #ifdef SPARSERREF_HAVE_RR_CORE
 				qpack::common_den cden; // carried over the rows of the block: they usually share it
 #endif
+				qpack::big_den bd;      // the same beyond the fixed-size path
+				std::vector<ulong> scratch(use_bd ? k : 0);
 				for (size_t li = sg.li0; li < sg.li1 && !failed.load(std::memory_order_relaxed) && !opt->abort; li++) {
 					sg.row_limb[li - sg.li0] = (uint64_t)(p - sg.limbs.p);
 					for (size_t e = eoff[li]; e < eoff[li + 1]; e++) {
@@ -3884,11 +3907,24 @@ namespace SparseRREF {
 							}
 						}
 #endif
+						if (use_bd) {
+							for (slong t = 0; t < k; t++)
+								rk[t] = ch.resid[t][e - ch.e0];
+							if (bd.rec(rk.data(), k, md.data(), comb, temp, mbits, scratch.data(), q.data())) {
+								SPR_INC(bd_hit, 1);
+								meta[e - ch.e0] = qpack::write_fmpq(p, q.data());
+								continue;
+							}
+							SPR_DO(if (bd.on) SPR_INC(bd_miss, 1));
+						}
+						SPR_INC(n_euclid, 1);
 						if (!rec_entry(ch, e, k, comb, temp, rk.data(), z, q)) {
 							failed = true;
 							note_hard(e);
 							break;
 						}
+						if (use_bd)
+							bd.take(q.data(), k, comb, temp, mbits);
 						meta[e - ch.e0] = qpack::write_fmpq(p, q.data());
 					}
 				}
@@ -4184,114 +4220,14 @@ namespace SparseRREF {
 				}
 		}
 
-		while (!isok && !opt->abort) {
-			prime = n_nextprime(prime, 0);
-			auto ce = clocknow();
-
-			if (verbose) {
-				progress_message(opt, ">> Reconstruct failed, now mod ~ 2^%llu, used time: %g s\n",
-					(unsigned long long)mod.bits(), usedtime(cs, ce));
-			}
-			cs = ce;
-			F = field_t(FIELD_Fp, prime);
-			SPR_DO(SparseRREF::prof::d().primes++);
-			SPR_T0(spr_red2);
-			pool.detach_loop(0, mat.nrow, [&](auto i) {
-				matul[i] = mat[i] % F.mod;
-				});
-			pool.wait();
-			SPR_ADD(reduce, spr_red2);
-			if (opt->abort)
-				break;
-			SPR_T0(spr_rp);
-			// a replay on the GPU hands its rows over here: their residues go by entry into cur and their
-			// columns are compared with the result's (the rows of level 0 stay in matul)
-			cur_valid = false;
-			std::atomic<bool> same_support = true;
-			std::vector<char> got;
-			bool delivered = false;
-#ifdef SPARSERREF_USE_CUDA
-			replay_sink_t sink = [&](const uint32_t* rows, uint32_t n, const uint64_t* o, const uint32_t* col,
-				const uint64_t* val) -> bool {
-				pool.detach_loop<size_t>(0, n, [&](size_t i) {
-					const size_t li = li_of_row[rows[i]];
-					const size_t cnt = o[i + 1] - o[i];
-					if (li == SIZE_MAX) {
-						if (cnt > 0)
-							same_support = false;
-						return;
-					}
-					got[li] = 1;
-					bool ok = cnt == eoff[li + 1] - eoff[li];
-					for (size_t j = 0; ok && j < cnt; j++)
-						ok = col[o[i] + j] == (uint32_t)out.col[eoff[li] + j];
-					if (!ok) {
-						same_support = false;
-						return;
-					}
-					std::memcpy(cur.get() + eoff[li], val + o[i], cnt * 8);
-					});
-				pool.wait();
-				return true;
-				};
-			if (opt->policy.gpu.enabled) {
-				if (!cur)
-					cur.reset(new ulong[nent > 0 ? nent : 1]);
-				got.assign(leftrows.size(), 0);
-				sparse_mat_direct_rref(matul, pivots, F, opt, true, &sink, &delivered);
-			}
-			else
-#endif
-				sparse_mat_direct_rref(matul, pivots, F, opt);
-			SPR_ADD(replay, spr_rp);
-			// the direct rref bails out early when aborting, which can leave matul
-			// structurally different from the first result, so stop before using it
-			if (opt->abort)
-				break;
-			SPR_T0(spr_crt);
-			// a prime that changes the support of the result is not usable: skip it
-			if (delivered) {
-				// the rows not handed over are in matul
-				pool.detach_loop<size_t>(0, leftrows.size(), [&](size_t li) {
-					if (got[li])
-						return;
-					const auto& a = matul[leftrows[li]];
-					bool ok = a.nnz() == eoff[li + 1] - eoff[li];
-					for (size_t j = 0; ok && j < a.nnz(); j++)
-						ok = a(j) == out.col[eoff[li] + j];
-					if (!ok)
-						same_support = false;
-					else
-						std::copy(a.entries, a.entries + a.nnz(), cur.get() + eoff[li]);
-					});
-				pool.wait();
-				cur_valid = true;
-			}
-			else {
-				pool.detach_loop<size_t>(0, leftrows.size(), [&](size_t li) {
-					const auto& a = matul[leftrows[li]];
-					bool ok = a.nnz() == eoff[li + 1] - eoff[li];
-					for (size_t j = 0; ok && j < a.nnz(); j++)
-						ok = a(j) == out.col[eoff[li] + j];
-					if (!ok)
-						same_support = false;
-					});
-				pool.wait();
-			}
-			if (!same_support) {
-				if (verbose)
-					progress_message(opt, ">> prime %llu changes the support of the result, skipped\n",
-						(unsigned long long)prime);
-				SPR_ADD(crt, spr_crt);
-				continue;
-			}
-			SPR_DO(SparseRREF::prof::d().t_check += SparseRREF::prof::since(spr_crt));
+		// the residues of a prime whose replay agreed with the result's support, from res_row: the
+		// packed chunks check their values against them (one that disagrees goes back to residues),
+		// then every chunk with residues stores them
+		auto take_prime = [&](const ulong p) {
 			SPR_T0(spr_st);
-			// packed chunks check their values against the new residues; one that disagrees goes back
-			// to residues; then every chunk with residues stores the new prime's
 			{
 				SPR_T0(spr_v);
-				const auto bad = verify_packed(prime);
+				const auto bad = verify_packed(p);
 				SPR_ADD(t_verify, spr_v);
 				for (size_t c = 0; c < chunks.size(); c++) {
 					auto& ch = chunks[c];
@@ -4311,11 +4247,234 @@ namespace SparseRREF {
 				}
 			}
 			store_residues();
-			release_matul();
-			primes_used.push_back(prime);
+			primes_used.push_back(p);
 			SPR_ADD(t_store, spr_st);
 			SPR_MEM("prime stored");
-			mod = mod * prime;
+			mod = mod * p;
+			};
+
+		// Primes side by side (exec_policy::replay_mb): once a few primes have not sufficed, up to one
+		// per thread, as many as their matrices fit the budget, each replayed on one thread through an
+		// option of its own (an inline pool, no GPU); then they are taken in their order, as if one
+		// after another. Not where the replays go to the GPU. replay_batch() is how many primes go side
+		// by side this time; 0: one prime on all threads (with a single thread, one prime through the
+		// inline option, which saves the pool's handoffs)
+		const size_t in_nnz = mat.nnz();
+		auto replay_batch = [&]() -> size_t {
+			const size_t mb = opt->policy.replay_mb;
+			const size_t k = primes_used.size();
+			if (mb == 0 || k < 4)
+				return 0;
+#ifdef SPARSERREF_USE_CUDA
+			// replays the GPU would take (as in direct_rref_gpu: CUDA runs, or they are large enough)
+			const auto& gp = opt->policy.gpu;
+			if (gp.enabled && gp.replay && (gpu::initialized() || in_nnz >= gp.min_nnz))
+				return 0;
+#endif
+			// a prime's matrix: the reduced input and the result's rows, twice for the growth on the way
+			const size_t per = 2 * (in_nnz + nent) * (sizeof(index_t) + sizeof(ulong))
+				+ mat.nrow * sizeof(sparse_vec<ulong, index_t>) + 1;
+			const size_t B = std::min({ (size_t)nthreads, k, (mb << 20) / per });
+			return (B >= 2 || (nthreads == 1 && B == 1)) ? B : 0;
+			};
+		std::vector<std::unique_ptr<rref_option>> side; // the options of the primes side by side
+		std::vector<sparse_mat<ulong, index_t>> side_mat;
+
+		while (!isok && !opt->abort) {
+			const size_t B = replay_batch();
+			if (B >= 1) {
+				std::vector<ulong> bp(B);
+				for (size_t b = 0; b < B; b++)
+					bp[b] = prime = n_nextprime(prime, 0);
+				auto ce = clocknow();
+				if (verbose) {
+					progress_message(opt, ">> Reconstruct failed, now mod ~ 2^%llu, used time: %g s; next %zu primes side by side\n",
+						(unsigned long long)mod.bits(), usedtime(cs, ce), B);
+				}
+				cs = ce;
+				SPR_INC(primes, B);
+				while (side.size() < B) {
+					auto o = std::make_unique<rref_option>();
+					o->pool.set_inline(true); // its parallel loops run on the thread of its prime
+					o->verbose = false;
+					o->progress_out = nullptr;
+					o->shrink_memory = opt->shrink_memory;
+					o->is_back_sub = opt->is_back_sub;
+					o->eliminate_one_nnz = opt->eliminate_one_nnz;
+					o->method = opt->method;
+					o->print_step = opt->print_step;
+					o->col_weight = opt->col_weight;
+					o->policy = opt->policy;
+					o->policy.gpu.enabled = false;
+					o->policy.trim_heap = false;
+					side.push_back(std::move(o));
+				}
+				while (side_mat.size() < B)
+					side_mat.emplace_back(mat.nrow, mat.ncol);
+				std::vector<char> same(B, 0);
+				std::vector<std::exception_ptr> err(B); // a pool task must not throw: rethrown here
+				SPR_T0(spr_rp);
+				pool.detach_loop<size_t>(0, B, [&](size_t b) {
+					try {
+						const field_t Fb(FIELD_Fp, bp[b]);
+						auto& m = side_mat[b];
+						for (size_t i = 0; i < mat.nrow; i++)
+							m[i] = mat[i] % Fb.mod;
+						sparse_mat_direct_rref(m, pivots, Fb, side[b].get());
+						bool ok = true;
+						for (size_t li = 0; ok && li < leftrows.size(); li++) {
+							const auto& a = m[leftrows[li]];
+							ok = a.nnz() == eoff[li + 1] - eoff[li];
+							for (size_t j = 0; ok && j < a.nnz(); j++)
+								ok = a(j) == out.col[eoff[li] + j];
+						}
+						same[b] = ok;
+					}
+					catch (...) {
+						err[b] = std::current_exception();
+					}
+					});
+				pool.wait();
+				for (auto& x : err)
+					if (x)
+						std::rethrow_exception(x);
+				SPR_ADD(replay, spr_rp);
+				if (opt->abort)
+					break;
+				SPR_T0(spr_crt);
+				cur_valid = false;
+				size_t taken = 0;
+				for (size_t b = 0; b < B; b++) {
+					if (!same[b]) {
+						if (verbose)
+							progress_message(opt, ">> prime %llu changes the support of the result, skipped\n",
+								(unsigned long long)bp[b]);
+						continue;
+					}
+					resmat = &side_mat[b];
+					take_prime(bp[b]);
+					taken++;
+				}
+				resmat = &matul;
+				if (opt->policy.memory != memory_mode::fast) {
+					pool.detach_loop<size_t>(0, B, [&](size_t b) {
+						for (size_t i = 0; i < side_mat[b].nrow; i++)
+							side_mat[b][i].clear();
+						});
+					pool.wait();
+					trim_heap(opt->policy);
+				}
+				SPR_ADD(crt, spr_crt);
+				if (taken == 0)
+					continue;
+			}
+			else {
+				prime = n_nextprime(prime, 0);
+				auto ce = clocknow();
+
+				if (verbose) {
+					progress_message(opt, ">> Reconstruct failed, now mod ~ 2^%llu, used time: %g s\n",
+						(unsigned long long)mod.bits(), usedtime(cs, ce));
+				}
+				cs = ce;
+				F = field_t(FIELD_Fp, prime);
+				SPR_DO(SparseRREF::prof::d().primes++);
+				SPR_T0(spr_red2);
+				pool.detach_loop(0, mat.nrow, [&](auto i) {
+					matul[i] = mat[i] % F.mod;
+					});
+				pool.wait();
+				SPR_ADD(reduce, spr_red2);
+				if (opt->abort)
+					break;
+				SPR_T0(spr_rp);
+				// a replay on the GPU hands its rows over here: their residues go by entry into cur and their
+				// columns are compared with the result's (the rows of level 0 stay in matul)
+				cur_valid = false;
+				std::atomic<bool> same_support = true;
+				std::vector<char> got;
+				bool delivered = false;
+#ifdef SPARSERREF_USE_CUDA
+				replay_sink_t sink = [&](const uint32_t* rows, uint32_t n, const uint64_t* o, const uint32_t* col,
+					const uint64_t* val) -> bool {
+					pool.detach_loop<size_t>(0, n, [&](size_t i) {
+						const size_t li = li_of_row[rows[i]];
+						const size_t cnt = o[i + 1] - o[i];
+						if (li == SIZE_MAX) {
+							if (cnt > 0)
+								same_support = false;
+							return;
+						}
+						got[li] = 1;
+						bool ok = cnt == eoff[li + 1] - eoff[li];
+						for (size_t j = 0; ok && j < cnt; j++)
+							ok = col[o[i] + j] == (uint32_t)out.col[eoff[li] + j];
+						if (!ok) {
+							same_support = false;
+							return;
+						}
+						std::memcpy(cur.get() + eoff[li], val + o[i], cnt * 8);
+						});
+					pool.wait();
+					return true;
+					};
+				if (opt->policy.gpu.enabled) {
+					if (!cur)
+						cur.reset(new ulong[nent > 0 ? nent : 1]);
+					got.assign(leftrows.size(), 0);
+					sparse_mat_direct_rref(matul, pivots, F, opt, true, &sink, &delivered);
+				}
+				else
+#endif
+					sparse_mat_direct_rref(matul, pivots, F, opt);
+				SPR_ADD(replay, spr_rp);
+				// the direct rref bails out early when aborting, which can leave matul
+				// structurally different from the first result, so stop before using it
+				if (opt->abort)
+					break;
+				SPR_T0(spr_crt);
+				// a prime that changes the support of the result is not usable: skip it
+				if (delivered) {
+					// the rows not handed over are in matul
+					pool.detach_loop<size_t>(0, leftrows.size(), [&](size_t li) {
+						if (got[li])
+							return;
+						const auto& a = matul[leftrows[li]];
+						bool ok = a.nnz() == eoff[li + 1] - eoff[li];
+						for (size_t j = 0; ok && j < a.nnz(); j++)
+							ok = a(j) == out.col[eoff[li] + j];
+						if (!ok)
+							same_support = false;
+						else
+							std::copy(a.entries, a.entries + a.nnz(), cur.get() + eoff[li]);
+						});
+					pool.wait();
+					cur_valid = true;
+				}
+				else {
+					pool.detach_loop<size_t>(0, leftrows.size(), [&](size_t li) {
+						const auto& a = matul[leftrows[li]];
+						bool ok = a.nnz() == eoff[li + 1] - eoff[li];
+						for (size_t j = 0; ok && j < a.nnz(); j++)
+							ok = a(j) == out.col[eoff[li] + j];
+						if (!ok)
+							same_support = false;
+						});
+					pool.wait();
+				}
+				if (!same_support) {
+					if (verbose)
+						progress_message(opt, ">> prime %llu changes the support of the result, skipped\n",
+							(unsigned long long)prime);
+					SPR_ADD(crt, spr_crt);
+					continue;
+				}
+				SPR_DO(SparseRREF::prof::d().t_check += SparseRREF::prof::since(spr_crt));
+				take_prime(prime);
+				release_matul();
+				SPR_ADD(crt, spr_crt);
+			}
+			SPR_T0(spr_crt);
 			const slong k = (slong)primes_used.size();
 
 			if (any_unpacked()) {
@@ -4328,7 +4487,7 @@ namespace SparseRREF {
 				SPR_ADD(t_comb, spr_cb);
 				SPR_T0(spr_sm);
 				// candidate checks, cheapest first: the entries that failed last time (they usually fail
-				// again until the very end), then a sample of about 4096 entries, then all entries
+				// again until the very end), then a sample of 1/16 of the entries (256 to 4096), then all
 				bool sample_ok = true;
 				{
 					fmpz_comb_temp_t temp;
@@ -4352,24 +4511,39 @@ namespace SparseRREF {
 							rcum.push_back(rcum.back() + chunks[c].entries());
 						}
 					const size_t nres = rcum.back();
-					const size_t stride = std::max<size_t>(1, nres / 4096);
+					// about 1/16 of the entries, 256 to 4096: the sample stays cheap next to the full attempt
+					const size_t stride = std::max<size_t>(1, nres / std::clamp<size_t>(nres / 16, 256, 4096));
+					const bool use_bd = big_den_on(k, comb);
+					std::vector<nmod_t> md;
+					const slong mbits = (slong)mod.bits();
+					if (use_bd)
+						big_den_setup(k, md);
 					const size_t nsample = (nres + stride - 1) / stride;
 					std::atomic<bool> failed = false;
 					pool.detach_blocks<size_t>(0, nsample, [&](const size_t s, const size_t e) {
 						fmpz_comb_temp_t temp;
 						fmpz_comb_temp_init(temp, comb);
-						std::vector<ulong> rk(k);
+						std::vector<ulong> rk(k), scratch(use_bd ? k : 0);
 						int_t z;
 						rat_t qtmp;
+						qpack::big_den bd;
 						for (size_t i = s; i < e && !failed.load(std::memory_order_relaxed); i++) {
 							const size_t at = i * stride;
 							const size_t r = (size_t)(std::upper_bound(rcum.begin(), rcum.end(), at) - rcum.begin()) - 1;
 							const auto& ch = chunks[rc[r]];
 							const size_t x = ch.e0 + (at - rcum[r]);
+							if (use_bd) {
+								for (slong t = 0; t < k; t++)
+									rk[t] = ch.resid[t][x - ch.e0];
+								if (bd.rec(rk.data(), k, md.data(), comb, temp, mbits, scratch.data(), qtmp.data()))
+									continue;
+							}
 							if (!rec_ok(ch, x, k, comb, temp, rk.data(), z, qtmp)) {
 								failed = true;
 								note_hard(x);
 							}
+							else if (use_bd)
+								bd.take(qtmp.data(), k, comb, temp, mbits);
 						}
 						fmpz_comb_temp_clear(temp);
 						});

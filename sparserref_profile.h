@@ -7,6 +7,7 @@
 // Optional phase timers (compile with -DSPARSERREF_PROFILE); without the macro every hook is a no-op.
 #pragma once
 #ifdef SPARSERREF_PROFILE
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +29,7 @@ namespace SparseRREF::prof {
 		double t_check = 0, t_store = 0, t_comb = 0, t_sample = 0, t_full = 0;
 		size_t n_full = 0, gpu_rr_cpu = 0, n_verify = 0, n_unpack = 0, n_packed = 0;
 		double t_verify = 0, t_unpack = 0;
+		size_t bd_hit = 0, bd_miss = 0, n_euclid = 0;
 		double gpu_rr = 0, gpu_rr_convert = 0, gpu_rr_stage = 0, gpu_rr_wait = 0, gpu_rr_h2d = 0, gpu_rr_kernel = 0, gpu_rr_d2h = 0;
 		double gpu_res = 0, gpu_res_backsub = 0, gpu_res_rescale = 0, gpu_res_prep = 0, gpu_res_kernel = 0, gpu_res_compact = 0, gpu_res_xfer = 0, gpu_res_writeback = 0;
 		size_t gpu_res_compactions = 0, gpu_res_calls = 0, gpu_level_reorders = 0, level_batches = 0, level_retries = 0;
@@ -40,6 +42,13 @@ namespace SparseRREF::prof {
 		size_t res_ent = 0, res_hist[4][4] = {}, res_same_den = 0, res_limbs = 0;
 	};
 	inline data_t& d() { static data_t x; return x; }
+	// a counter or timer that threads may add to at once (the replays of several primes run side by side)
+	template <typename V, typename W>
+	inline void add(V& x, W v) {
+		std::atomic_ref<V> a(x);
+		V o = a.load(std::memory_order_relaxed);
+		while (!a.compare_exchange_weak(o, (V)(o + v), std::memory_order_relaxed)) {}
+	}
 	using clk = std::chrono::steady_clock;
 	inline double since(clk::time_point t) { return std::chrono::duration<double>(clk::now() - t).count(); }
 	inline clk::time_point t_origin() { static const clk::time_point t = clk::now(); return t; }
@@ -81,8 +90,8 @@ namespace SparseRREF::prof {
 			p.backsub, p.bs_transpose, p.bs_schur, p.bs_batches, p.bs_schur_rows, p.bs_tri);
 		std::fprintf(f, "PROFILE reconstruct: primes %zu, reduce %.3f, first rational reconstruction %.3f, height checks %.3f, replay %.3f, crt+rr %.3f\n",
 			p.primes, p.reduce, p.rr_first, p.height, p.replay, p.crt);
-		std::fprintf(f, "PROFILE crt detail: support check %.3f, store %.3f (verify %.3f in %zu, unpack %.3f in %zu), comb %.3f, sample %.3f, full %.3f (%zu full attempts, %zu chunks packed)\n",
-			p.t_check, p.t_store, p.t_verify, p.n_verify, p.t_unpack, p.n_unpack, p.t_comb, p.t_sample, p.t_full, p.n_full, p.n_packed);
+		std::fprintf(f, "PROFILE crt detail: support check %.3f, store %.3f (verify %.3f in %zu, unpack %.3f in %zu), comb %.3f, sample %.3f, full %.3f (%zu full attempts, %zu chunks packed); common denominator %zu taken, %zu not, %zu by Euclid\n",
+			p.t_check, p.t_store, p.t_verify, p.n_verify, p.t_unpack, p.n_unpack, p.t_comb, p.t_sample, p.t_full, p.n_full, p.n_packed, p.bd_hit, p.bd_miss, p.n_euclid);
 		std::fprintf(f, "PROFILE gpu rr: %.3f s in all (staging %.3f, waiting %.3f, conversion %.3f; on the gpu h2d %.3f, kernels %.3f, d2h %.3f), %zu entries left to the cpu\n",
 			p.gpu_rr, p.gpu_rr_stage, p.gpu_rr_wait, p.gpu_rr_convert, p.gpu_rr_h2d, p.gpu_rr_kernel, p.gpu_rr_d2h, p.gpu_rr_cpu);
 		std::fprintf(f, "PROFILE gpu: %zu parts, host pack %.3f, wait %.3f, unpack %.3f; on the gpu h2d %.3f, kernel %.3f, d2h %.3f; rows sent %zu, skipped %zu, rerun %zu, entries in %zu\n",
@@ -114,12 +123,14 @@ namespace SparseRREF::prof {
 	}
 }
 #define SPR_T0(name) auto name = SparseRREF::prof::clk::now()
-#define SPR_ADD(field, t0) (SparseRREF::prof::d().field += SparseRREF::prof::since(t0))
+#define SPR_ADD(field, t0) SparseRREF::prof::add(SparseRREF::prof::d().field, SparseRREF::prof::since(t0))
+#define SPR_INC(field, n) SparseRREF::prof::add(SparseRREF::prof::d().field, n)
 #define SPR_DO(stmt) stmt
 #define SPR_MEM(label) SparseRREF::prof::mem_mark(label)
 #else
 #define SPR_T0(name) ((void)0)
 #define SPR_ADD(field, t0) ((void)0)
+#define SPR_INC(field, n) ((void)0)
 #define SPR_DO(stmt) ((void)0)
 #define SPR_MEM(label) ((void)0)
 #endif

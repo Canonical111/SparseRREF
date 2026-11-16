@@ -151,6 +151,75 @@ namespace SparseRREF::qpack {
 		}
 	}
 
+	// A running common denominator D for moduli beyond the fixed-size path (FLINT arithmetic). With a
+	// the CRT value of an entry, y = D a mod m in (-m/2, m/2) and g = gcd(y, D), the fraction
+	// (y/g)/(D/g) is in lowest terms and congruent to a (D is coprime to m). When the entry's
+	// denominator d divides D, y is exactly n D/d, which is far below m; when it does not, y is in
+	// effect a random residue. So a fraction is taken when |y| < m / 2^65 (a wrong one with probability
+	// 2^-64). Unlike the fixed-size path this does not insist on FLINT's bounds N = sqrt(m/2), which the
+	// least common multiple of a row's denominators often exceeds when the numbers are large: a value
+	// may be found at a smaller modulus than the Euclidean reconstruction needs. That is safe because
+	// every value agrees with all residues, later primes check the packed values, and the height
+	// condition at the end certifies the result, which is unique. One CRT and a gcd instead of the half
+	// extended Euclid (about 2.5x less at 400 limbs).
+	struct big_den {
+		fmpz_t D, y, g;
+		std::vector<ulong> dm; // D mod p_t
+		bool on = false;
+		slong excess = 0;      // the largest excess of numerator over denominator bits taken in with D
+		big_den() { fmpz_init(D); fmpz_init(y); fmpz_init(g); }
+		~big_den() { fmpz_clear(D); fmpz_clear(y); fmpz_clear(g); }
+		big_den(const big_den&) = delete;
+		big_den& operator=(const big_den&) = delete;
+		// the fraction of the residues r[0..k) (modulus of mbits bits) into q by way of D; false if there
+		// is no D or y is not small (then Euclid decides)
+		bool rec(const ulong* r, slong k, const nmod_t* md, const fmpz_comb_struct* comb,
+			fmpz_comb_temp_struct* temp, slong mbits, ulong* scratch, fmpq_t q) {
+			if (!on)
+				return false;
+			for (slong t = 0; t < k; t++)
+				scratch[t] = nmod_mul(r[t], dm[t], md[t]);
+			fmpz_multi_CRT_ui(y, scratch, comb, temp, 1);
+			if ((slong)fmpz_bits(y) + 66 > mbits)
+				return false;
+			fmpz_gcd(g, y, D);
+			fmpz_divexact(fmpq_numref(q), y, g);
+			fmpz_divexact(fmpq_denref(q), D, g);
+			return true;
+		}
+		// takes in the denominator of q, an entry that Euclid reconstructed. D grows to the least common
+		// multiple while y = n D/d keeps 66 bits below m for the entries taken in (their excess of
+		// numerator over denominator bits) and D stays near one denominator's size (about a row's); else
+		// it starts again from d
+		void take(const fmpq_t q, slong k, const fmpz_comb_struct* comb, fmpz_comb_temp_struct* temp, slong mbits) {
+			const fmpz* d = fmpq_denref(q);
+			const slong db = (slong)fmpz_bits(d), ex = (slong)fmpz_bits(fmpq_numref(q)) - db;
+			if (on && fmpz_divisible(D, d)) {
+				excess = std::max(excess, ex);
+				return;
+			}
+			bool grown = false;
+			if (on) {
+				fmpz_lcm(y, D, d);
+				const slong lb = (slong)fmpz_bits(y);
+				if (lb + std::max(excess, ex) + 67 <= mbits && lb <= db + db / 8 + 64) {
+					fmpz_swap(D, y);
+					excess = std::max(excess, ex);
+					grown = true;
+				}
+			}
+			if (!grown) {
+				fmpz_set(D, d);
+				excess = ex;
+			}
+			dm.resize(k);
+			fmpz_multi_mod_ui(dm.data(), D, comb, temp);
+			on = true;
+			for (slong t = 0; t < k && on; t++)
+				on = dm[t] != 0;
+		}
+	};
+
 	// malloc'd limb storage that can be shrunk in place
 #ifdef SPARSERREF_HAVE_RR_CORE
 	static_assert(sizeof(mp_limb_t) == 8 && GMP_NUMB_BITS == 64, "64-bit GMP limbs expected");

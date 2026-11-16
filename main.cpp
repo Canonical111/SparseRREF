@@ -112,6 +112,7 @@ static void apply_environment(SparseRREF::exec_policy& pol, bool gpu_flag) {
 	flag("SPARSERREF_GPU_LARGE", g.call_large_u);
 	size("SPARSERREF_RR_CHUNK", pol.rr_chunk);
 	size("SPARSERREF_RR_KEEP_MB", pol.rr_keep_mb);
+	size("SPARSERREF_REPLAY_MB", pol.replay_mb);
 	flag("SPARSERREF_TRIM", pol.trim_heap);
 }
 
